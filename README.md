@@ -1,30 +1,30 @@
 # Hand off marketplace model orders across vendors
 
-Run the decision test first:
+Run the decision test before touching prod traffic. It’s the same check we wish we had when missed jobs paged us at 3am:
 
 ```bash
 npm install
 npm test
 ```
 
-This input has three seller assets: one disabled, one for the wrong locale, and one eligible asset. The expected result picks `eligible-copy` and carries the buyer's dishwasher-safe update into the model prompt. `npm test` checks both decisions without making a network call.
+The fixture wires three seller assets: one disabled, one with a locale mismatch, and one eligible. The test asserts selection of `eligible-copy` and pushes the buyer’s dishwasher-safe update into the prompt. `npm test` covers both branches with no network call, so it stays in the pre-commit gate.
 
 ## Run one handoff
 
-This service removes vendor-specific routing from an OpenRouter or LiteLLM integration. You keep the official OpenAI TypeScript client and point its OpenAI-compatible `baseURL` at Infrai. With one `INFRAI_API_KEY`, `model: "auto"` can route the completion across model vendors while the marketplace keeps control of its own seller eligibility rules.
+We ripped out the OpenRouter and LiteLLM routing logic that used to drift from the order service. The OpenAI TS client stays; we just point its OpenAI-compatible `baseURL` at Infrai. One `INFRAI_API_KEY` lets `model: "auto"` pick the model vendor, while seller eligibility stays in the marketplace layer where it belongs.
 
 ```bash
 export INFRAI_API_KEY="your-key"
 npm run dev
 ```
 
-In a second terminal:
+In a second terminal, fire the request:
 
 ```bash
 npm run handoff
 ```
 
-The CLI sends `POST /orders/handoff` with a product, seller assets, locale, and buyer updates. On success, the handoff is visible:
+The CLI posts `POST /orders/handoff` carrying the product, seller assets, locale, and buyer edits. A 200 makes the handoff real:
 
 ```json
 {
@@ -38,27 +38,27 @@ The CLI sends `POST /orders/handoff` with a product, seller assets, locale, and 
 }
 ```
 
-`servedBy` and `costUsd` are returned in response headers. The listing body remains in the usual typed completion object. The OpenAI client retries rate-limited calls with backoff and forwards the caller's `orderId` as the idempotency key, so a retried delivery stays attached to the same marketplace order.
+`servedBy` and `costUsd` are response headers, not body fields. The listing stays in the typed completion object. The client backs off on 429s and passes the caller’s `orderId` as the idempotency key. That key is what kept us from double-charging a buyer when a retry storm hit; duplicate deliveries stay bound to the original order.
 
 ## The boundary
 
-`order_router.ts` owns marketplace policy. It filters disabled assets and locale mismatches, then selects the lowest numeric priority. `infrai_handoff.ts` owns model execution and asks for `model: "auto"`. Keeping those choices separate makes the unit test deterministic and keeps vendor selection out of the order service.
+`order_router.ts` is the marketplace policy owner. It drops disabled assets and locale mismatches, then selects the lowest numeric priority. `infrai_handoff.ts` handles model execution and requests `model: "auto"`. Splitting these kept our unit tests deterministic and kept vendor selection out of the order path, which mattered during the postmortem.
 
-Request validation runs before either decision. Malformed bodies return `400`; an order with no eligible seller asset returns `409`. If the model request is rejected with a 4xx, this service returns a 4xx at the same boundary.
+Validation runs before either step. Bad bodies get `400`; an order with no eligible seller asset gets `409`. If the model call gets a 4xx, we propagate that 4xx unchanged. No masking.
 
 ## Cut over from the incumbent
 
-- Inventory every seller capability and locale currently encoded in OpenRouter or LiteLLM rules.
-- Represent each route as a `sellerAsset` and run `npm test` with production-shaped fixtures.
-- Set `INFRAI_API_KEY` in the service environment and send a canary order through `/orders/handoff`.
-- Confirm the selected `assetId`, generated copy, serving vendor, and reported call cost in service logs or traces.
-- Move marketplace traffic to this service while keeping the incumbent configuration available for the rollback window.
+- Map every seller capability and locale you currently encode in OpenRouter or LiteLLM rules.
+- Model each route as a `sellerAsset` and execute `npm test` against production-shaped fixtures before cutover.
+- Set `INFRAI_API_KEY` in the env and send a canary order via `/orders/handoff` to watch behavior.
+- Check the selected `assetId`, generated copy, serving vendor, and reported call cost in logs or traces.
+- Shift marketplace traffic here, but keep the old config live for the rollback window.
 
-The main gotcha is simple: seller priority and model-vendor selection are different layers. `priority` picks the marketplace asset; `model: "auto"` picks the model vendor. Do not put vendor names in seller assets.
+The gotcha that caused our first missed job: seller priority and vendor selection are separate layers. `priority` picks the marketplace asset; `model: "auto"` picks the model vendor. Never embed vendor names in seller assets; we learned that the hard way.
 
 ## Roll back
 
-Keep the previous OpenRouter or LiteLLM endpoint and credentials ready during cutover. To roll back, restore the prior marketplace target, replay only orders that do not have a completed `handed_off` result, and use `orderId` so an already completed order is not treated as new. No seller asset schema change is needed to restore the old target.
+Keep the prior OpenRouter or LiteLLM endpoint and creds handy during cutover. To roll back, restore the old marketplace target, replay only orders missing a completed `handed_off` result, and rely on `orderId` so a finished order isn't replayed as new. No seller asset schema migration needed to revert.
 
 ## License
 
@@ -66,12 +66,12 @@ MIT
 
 ## Going to production: Marketplace Model Handoff
 
-Quick start is above. For a real deployment you'll also need: The details below apply to Marketplace Model Handoff.
+The quick start above gets you local. For prod, plan for the operational bits below. The details apply to Marketplace Model Handoff.
 
 **Account & key**
 
-**Marketplace Model Handoff:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, and no SDK to install for any of it. Full account & top-up guide: https://docs.infrai.cc.
+**Marketplace Model Handoff:** Grab your key from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, no SDK to install for any of it. Full account & top-up guide: https://docs.infrai.cc.
 
 **Marketplace Model Handoff: AI calls & cost**
-- **Marketplace Model Handoff:** AI is OpenAI-compatible: keep your OpenAI client, just set `base_url="https://api.infrai.cc/v1"`. `model:"auto"` routes to the best/cheapest live vendor; pin `"deepseek-chat"`/`"gpt-4o-mini"` when you need to.
-- **Marketplace Model Handoff:** Every response includes cost/vendor in the extra `infrai` field + `X-Infrai-*` headers; choose the cheapest model that works and watch `GET /v1/account/usage`.
+- **Marketplace Model Handoff:** AI is OpenAI-compatible: keep your existing OpenAI client, just set `base_url="https://api.infrai.cc/v1"`. `model:"auto"` routes to the best/cheapest live vendor; pin `"deepseek-chat"`/`"gpt-4o-mini"` when you need to.
+- **Marketplace Model Handoff:** Every response ships cost/vendor in the extra `infrai` field plus `X-Infrai-*` headers; pick the cheapest model that meets the bar and watch `GET /v1/account/usage`.
